@@ -7,9 +7,9 @@ from typing import Tuple
 import torch
 
 
-
+# ─────────────────────────────────────────────
 # AverageMeter
-
+# ─────────────────────────────────────────────
 class AverageMeter:
     """Computes and stores running average of a value."""
 
@@ -30,20 +30,18 @@ class AverageMeter:
         self.avg    = self.sum / self.count
 
 
-
+# ─────────────────────────────────────────────
 # accuracy
-
+# ─────────────────────────────────────────────
 @torch.no_grad()
 def accuracy(output: torch.Tensor, target: torch.Tensor,
              topk: Tuple[int, ...] = (1,)) -> list:
-    """
-    Returns top-k accuracy (%) for each k in topk.
-    """
+    """Returns top-k accuracy (%) for each k in topk."""
     maxk = max(topk)
     batch_size = target.size(0)
 
     _, pred = output.topk(maxk, dim=1, largest=True, sorted=True)
-    pred    = pred.t()                              # (maxk, batch)
+    pred    = pred.t()
     correct = pred.eq(target.view(1, -1).expand_as(pred))
 
     results = []
@@ -53,50 +51,68 @@ def accuracy(output: torch.Tensor, target: torch.Tensor,
     return results
 
 
-
+# ─────────────────────────────────────────────
 # Logging
-def setup_logging(rank: int, log_dir: str = "logs") -> logging.Logger:
+# ─────────────────────────────────────────────
+def setup_logging(rank: int, base_dir: str = ".", debug: bool = False) -> logging.Logger:
     """
-    Each rank writes its own log file: logs/rank_{rank}.log
-    Only rank 0 prints to stdout (via the print() calls in train.py).
+    Each rank writes its own log: <base_dir>/logs/rank_<rank>.log
+    Rank 0 also echoes to stdout.
+    Pass debug=True for DEBUG-level messages.
     """
+    log_dir = os.path.join(base_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, f"rank_{rank}.log")
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(log_path),
-        ],
+    level = logging.DEBUG if debug else logging.INFO
+
+    logger = logging.getLogger(f"rank{rank}")
+    logger.setLevel(level)
+    logger.handlers.clear()  # avoid duplicate handlers on reimport
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s][rank%(name)s] %(message)s",
+        datefmt="%H:%M:%S"
     )
-    return logging.getLogger(__name__)
+
+    fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    fh.setLevel(level)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    if rank == 0:
+        ch = logging.StreamHandler()
+        ch.setLevel(level)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+
+    logger.debug(f"Logging initialised → {log_path}  (debug={debug})")
+    return logger
 
 
-
+# ─────────────────────────────────────────────
 # Checkpointing
-
+# ─────────────────────────────────────────────
 def save_checkpoint(state: dict, is_best: bool,
                     ckpt_dir: str, epoch: int) -> None:
-    """
-    Saves checkpoint_epoch_N.pth.  If is_best, also copies to best.pth.
-    """
     os.makedirs(ckpt_dir, exist_ok=True)
     fname = os.path.join(ckpt_dir, f"checkpoint_epoch_{epoch:03d}.pth")
     torch.save(state, fname)
+    print(f"  [DEBUG] Checkpoint saved → {fname}")
     if is_best:
         best = os.path.join(ckpt_dir, "best.pth")
         shutil.copyfile(fname, best)
-        print(f"  Saved best checkpoint → {best}")
+        print(f"  [DEBUG] Best checkpoint updated → {best}")
 
 
 def load_checkpoint(path: str, device: torch.device) -> dict:
+    print(f"  [DEBUG] Loading checkpoint from {path} onto {device}")
     return torch.load(path, map_location=device)
 
 
-
+# ─────────────────────────────────────────────
 # MetricsTracker
-
+# ─────────────────────────────────────────────
 class MetricsTracker:
     """Accumulates per-epoch metric dicts for JSON export."""
 
@@ -112,11 +128,11 @@ class MetricsTracker:
         return self.history[-1] if self.history else {}
 
 
-
-# Timer context manager
-
+# ─────────────────────────────────────────────
+# Timer
+# ─────────────────────────────────────────────
 class Timer:
-    """Usage:  with Timer() as t: ...  then t.elapsed"""
+    """with Timer() as t: ...  → t.elapsed"""
 
     def __enter__(self):
         self._start = time.perf_counter()
