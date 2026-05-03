@@ -41,6 +41,9 @@ from utils import (
     save_checkpoint, MetricsTracker,
 )
 
+import os
+os.environ["USE_LIBUV"] = "0"
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="DDP Lightweight MLP — CIFAR-100")
