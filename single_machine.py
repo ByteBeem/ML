@@ -42,6 +42,8 @@ def parse_args():
     p.add_argument("--num_workers",  type=int,   default=None,
                    help="DataLoader workers. Defaults to 0 on Windows, 4 on Linux.")
     p.add_argument("--num_classes",  type=int,   default=100)
+    p.add_argument("--arch",         default="resnet18",
+                   help="Model architecture: resnet18 (default, low RAM) or resnet50")
     p.add_argument("--no_cuda",      action="store_true")
     p.add_argument("--debug",        action="store_true",
                    help="Print extra debug messages every batch.")
@@ -184,7 +186,7 @@ def main():
     train_loader, val_loader = build_dataloaders(args)
 
     print(f"  [DEBUG] Building model …")
-    model     = build_model(args.num_classes).to(device)
+    model     = build_model(args.num_classes, arch=args.arch).to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1).to(device)
     optimizer = torch.optim.SGD(
         model.parameters(), lr=args.lr,

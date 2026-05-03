@@ -60,6 +60,8 @@ def parse_args():
     p.add_argument("--num_workers",  type=int,   default=None,
                    help="DataLoader workers per rank. Default: 0 on Windows, 4 on Linux.")
     p.add_argument("--num_classes",  type=int,   default=100)
+    p.add_argument("--arch",         default="resnet18",
+                   help="Model architecture: resnet18 (default, low RAM) or resnet50")
     p.add_argument("--no_cuda",      action="store_true",
                    help="Force CPU (useful for testing on Windows without GPU)")
     p.add_argument("--resume",       default=None,
@@ -289,7 +291,7 @@ def main():
         # ── Model ───────────────────────────────────────────────────────────
         if rank == 0:
             print(f"  [DEBUG] Building model …")
-        model = build_model(args.num_classes).to(device)
+        model = build_model(args.num_classes, arch=args.arch).to(device)
         model = DDP(
             model,
             device_ids=[local_rank] if device.type == "cuda" else None,
