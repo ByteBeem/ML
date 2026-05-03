@@ -1,11 +1,8 @@
 """
-single_machine.py — Single-GPU / CPU baseline for comparison
-=============================================================
-Trains ResNet-50 on CIFAR-100 WITHOUT DDP.
-Run first, then run train.py with torchrun, then compare with compare_metrics.py.
-
+single_machine.py — Single-machine baseline (lightweight MLP on CIFAR-100)
+==========================================================================
 Usage:
-    python single_machine.py [--epochs 30] [--batch_size 128] [--no_cuda] [--debug]
+    python single_machine.py [--epochs 10] [--batch_size 64] [--debug]
 """
 
 import argparse
@@ -28,86 +25,58 @@ from model import build_model
 from utils import AverageMeter, accuracy, MetricsTracker
 
 
-# ─────────────────────────────────────────────
-# Args
-# ─────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--results_dir",  default="results")
-    p.add_argument("--epochs",       type=int,   default=30)
-    p.add_argument("--batch_size",   type=int,   default=128)
-    p.add_argument("--lr",           type=float, default=0.1)
+    p.add_argument("--epochs",       type=int,   default=10)
+    p.add_argument("--batch_size",   type=int,   default=64)
+    p.add_argument("--lr",           type=float, default=0.01)
     p.add_argument("--momentum",     type=float, default=0.9)
-    p.add_argument("--weight_decay", type=float, default=5e-4)
-    p.add_argument("--num_workers",  type=int,   default=None,
-                   help="DataLoader workers. Defaults to 0 on Windows, 4 on Linux.")
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--num_workers",  type=int,   default=None)
     p.add_argument("--num_classes",  type=int,   default=100)
-    p.add_argument("--arch",         default="resnet18",
-                   help="Model architecture: resnet18 (default, low RAM) or resnet50")
-    p.add_argument("--no_cuda",      action="store_true")
-    p.add_argument("--debug",        action="store_true",
-                   help="Print extra debug messages every batch.")
+    p.add_argument("--debug",        action="store_true")
     return p.parse_args()
 
 
 def _default_workers():
-    """0 on Windows (fork issues), 4 on Linux/Mac."""
-    return 0 if sys.platform.startswith("win") else 4
+    return 0 if sys.platform.startswith("win") else 2
 
 
-# ─────────────────────────────────────────────
-# Dataloaders
-# ─────────────────────────────────────────────
 def build_dataloaders(args):
-    print(f"  [DEBUG] Building datasets …")
+    print(f"  [DEBUG] Loading datasets …")
     train_ds = CIFAR100Kaggle(train=True,  transform=TRAIN_TRANSFORM)
     val_ds   = CIFAR100Kaggle(train=False, transform=VAL_TRANSFORM)
 
     nw = args.num_workers if args.num_workers is not None else _default_workers()
-    print(f"  [DEBUG] DataLoader num_workers={nw}")
+    print(f"  [DEBUG] num_workers={nw}  batch_size={args.batch_size}")
 
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size,
-        shuffle=True,  num_workers=nw, pin_memory=(nw > 0),
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size * 2,
-        shuffle=False, num_workers=nw, pin_memory=(nw > 0),
-    )
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=True,  num_workers=nw)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size * 2,
+                              shuffle=False, num_workers=nw)
     print(f"  [DEBUG] Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
     return train_loader, val_loader
 
 
-# ─────────────────────────────────────────────
-# Train one epoch
-# ─────────────────────────────────────────────
-def train_epoch(model, loader, criterion, optimizer, scaler,
-                device, epoch, total_epochs, debug=False):
+def train_epoch(model, loader, criterion, optimizer, device, epoch, total, debug):
     model.train()
     losses = AverageMeter("Loss")
     top1   = AverageMeter("Acc@1")
     top5   = AverageMeter("Acc@5")
 
-    bar = tqdm(
-        loader,
-        desc=f"  Epoch {epoch+1:>3d}/{total_epochs} [Train]",
-        unit="batch", ncols=100, leave=False,
-    )
+    bar = tqdm(loader, desc=f"  Epoch {epoch+1:>3d}/{total} [Train]",
+               unit="batch", ncols=100, leave=False)
 
     for i, (images, targets) in enumerate(bar):
-        images  = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
+        images, targets = images.to(device), targets.to(device)
 
-        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-            out  = model(images)
-            loss = criterion(out, targets)
+        out  = model(images)
+        loss = criterion(out, targets)
 
         optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        loss.backward()
+        optimizer.step()
 
         a1, a5 = accuracy(out, targets, topk=(1, 5))
         bs = images.size(0)
@@ -117,35 +86,27 @@ def train_epoch(model, loader, criterion, optimizer, scaler,
 
         bar.set_postfix(loss=f"{losses.avg:.4f}", acc=f"{top1.avg:.1f}%")
 
-        if debug and (i % 50 == 0):
+        if debug and i % 100 == 0:
             print(f"    [DEBUG] batch {i}/{len(loader)} "
-                  f"loss={losses.avg:.4f} acc1={top1.avg:.2f}%")
+                  f"loss={losses.avg:.4f} acc1={top1.avg:.1f}%")
 
     return losses.avg, top1.avg, top5.avg
 
 
-# ─────────────────────────────────────────────
-# Validate
-# ─────────────────────────────────────────────
 @torch.no_grad()
-def validate(model, loader, criterion, device, epoch, total_epochs, debug=False):
+def validate(model, loader, criterion, device, epoch, total, debug):
     model.eval()
     losses = AverageMeter("Loss")
     top1   = AverageMeter("Acc@1")
     top5   = AverageMeter("Acc@5")
 
-    bar = tqdm(
-        loader,
-        desc=f"  Epoch {epoch+1:>3d}/{total_epochs} [Val  ]",
-        unit="batch", ncols=100, leave=False,
-    )
+    bar = tqdm(loader, desc=f"  Epoch {epoch+1:>3d}/{total} [Val  ]",
+               unit="batch", ncols=100, leave=False)
 
     for i, (images, targets) in enumerate(bar):
-        images  = images.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-        with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-            out  = model(images)
-            loss = criterion(out, targets)
+        images, targets = images.to(device), targets.to(device)
+        out  = model(images)
+        loss = criterion(out, targets)
         a1, a5 = accuracy(out, targets, topk=(1, 5))
         bs = images.size(0)
         losses.update(loss.item(), bs)
@@ -153,78 +114,51 @@ def validate(model, loader, criterion, device, epoch, total_epochs, debug=False)
         top5.update(a5, bs)
         bar.set_postfix(loss=f"{losses.avg:.4f}", acc=f"{top1.avg:.1f}%")
 
-        if debug and (i % 50 == 0):
-            print(f"    [DEBUG] val batch {i}/{len(loader)} "
-                  f"loss={losses.avg:.4f} acc1={top1.avg:.2f}%")
-
     return losses.avg, top1.avg, top5.avg
 
 
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
 def main():
-    args = parse_args()
+    args   = parse_args()
+    device = torch.device("cpu")
     os.makedirs(args.results_dir, exist_ok=True)
 
-    device = torch.device(
-        "cuda" if not args.no_cuda and torch.cuda.is_available() else "cpu"
-    )
-
     print("=" * 65)
-    print("  SINGLE-MACHINE BASELINE — ResNet-50 on CIFAR-100")
+    print("  SINGLE-MACHINE BASELINE — Lightweight MLP on CIFAR-100")
     print("=" * 65)
-    print(f"  Device      : {device}")
-    print(f"  Platform    : {sys.platform}")
-    print(f"  PyTorch     : {torch.__version__}")
-    print(f"  Epochs      : {args.epochs}")
-    print(f"  Batch size  : {args.batch_size}")
-    print(f"  LR          : {args.lr}")
-    print(f"  Debug       : {args.debug}")
+    print(f"  Device     : {device}")
+    print(f"  PyTorch    : {torch.__version__}")
+    print(f"  Epochs     : {args.epochs}")
+    print(f"  Batch size : {args.batch_size}")
+    print(f"  LR         : {args.lr}")
+    print(f"  Debug      : {args.debug}")
     print("=" * 65)
 
     train_loader, val_loader = build_dataloaders(args)
 
-    print(f"  [DEBUG] Building model …")
-    model     = build_model(args.num_classes, arch=args.arch).to(device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1).to(device)
-    optimizer = torch.optim.SGD(
-        model.parameters(), lr=args.lr,
-        momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True,
-    )
+    model     = build_model(args.num_classes).to(device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay,
+                                nesterov=True)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-4
-    )
-
-    use_amp = device.type == "cuda"
-    # FIX: use the non-deprecated API (torch.amp.GradScaler)
-    scaler = torch.amp.GradScaler("cuda" if use_amp else "cpu", enabled=use_amp)
-    print(f"  [DEBUG] AMP enabled: {use_amp}")
+        optimizer, T_max=args.epochs, eta_min=1e-5)
 
     tracker     = MetricsTracker()
     best_acc    = 0.0
     total_start = time.perf_counter()
 
-    epoch_bar = tqdm(
-        range(args.epochs),
-        desc="  Overall progress",
-        unit="epoch", ncols=100, position=0,
-    )
-
-    for epoch in epoch_bar:
+    for epoch in range(args.epochs):
         ep_start = time.perf_counter()
-
         if args.debug:
-            print(f"\n  [DEBUG] === Epoch {epoch+1}/{args.epochs} start ===")
+            print(f"\n  [DEBUG] === Epoch {epoch+1}/{args.epochs} ===")
 
         train_loss, train_acc1, train_acc5 = train_epoch(
             model, train_loader, criterion, optimizer,
-            scaler, device, epoch, args.epochs, debug=args.debug,
-        )
+            device, epoch, args.epochs, args.debug)
         val_loss, val_acc1, val_acc5 = validate(
-            model, val_loader, criterion, device,
-            epoch, args.epochs, debug=args.debug,
-        )
+            model, val_loader, criterion,
+            device, epoch, args.epochs, args.debug)
         scheduler.step()
 
         ep_time  = time.perf_counter() - ep_start
@@ -242,24 +176,13 @@ def main():
             "epoch_time": round(ep_time, 2),
         })
 
-        epoch_bar.set_postfix(
-            loss=f"{train_loss:.4f}",
-            val=f"{val_acc1:.1f}%",
-            best=f"{best_acc:.1f}%",
-            t=f"{ep_time:.0f}s",
-        )
-
-        tqdm.write(
-            f"  Epoch {epoch+1:>3d}/{args.epochs} | "
-            f"LR {lr_now:.5f} | "
-            f"Train {train_loss:.4f}/{train_acc1:.1f}% | "
-            f"Val {val_loss:.4f}/{val_acc1:.1f}% | "
-            f"Best {best_acc:.1f}% | "
-            f"{ep_time:.1f}s"
-        )
+        print(f"  Epoch {epoch+1:>3d}/{args.epochs} | "
+              f"LR {lr_now:.5f} | "
+              f"Train {train_loss:.4f}/{train_acc1:.1f}% | "
+              f"Val {val_loss:.4f}/{val_acc1:.1f}% | "
+              f"Best {best_acc:.1f}% | {ep_time:.1f}s")
 
     total_time = time.perf_counter() - total_start
-
     results = {
         "mode"          : "single_machine",
         "world_size"    : 1,
@@ -272,18 +195,14 @@ def main():
         "best_val_acc1" : round(best_acc, 2),
         "history"       : tracker.history,
     }
-
     out = os.path.join(args.results_dir, "single_machine_results.json")
     with open(out, "w") as f:
         json.dump(results, f, indent=2)
 
     print("\n" + "=" * 65)
-    print("  COMPLETE")
+    print(f"  Total time : {total_time:.2f}s  |  Avg/epoch : {total_time/args.epochs:.2f}s")
+    print(f"  Best Val@1 : {best_acc:.2f}%  |  Results: {out}")
     print("=" * 65)
-    print(f"  Total time  : {total_time:.2f}s")
-    print(f"  Avg/epoch   : {total_time/args.epochs:.2f}s")
-    print(f"  Best Val@1  : {best_acc:.2f}%")
-    print(f"  Results     : {out}")
 
 
 if __name__ == "__main__":
