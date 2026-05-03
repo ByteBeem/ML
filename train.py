@@ -3,7 +3,7 @@ import json
 import os
 import time
 import socket
-
+from tqdm import tqdm
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -80,46 +80,55 @@ def build_dataloaders(args, rank, world_size):
 def train_epoch(model, loader, criterion, optimizer, scaler, device, args, epoch, rank):
     model.train()
 
-    losses   = AverageMeter("Loss")
-    top1     = AverageMeter("Acc@1")
-    top5     = AverageMeter("Acc@5")
-    batch_time = AverageMeter("Time")
+    losses = AverageMeter("Loss")
+    top1   = AverageMeter("Acc@1")
+    top5   = AverageMeter("Acc@5")
 
+    batch_time = AverageMeter("Time")
     end = time.perf_counter()
+
+    # ONLY rank 0 shows progress bar
+    if rank == 0:
+        loader = tqdm(loader, desc=f"Epoch {epoch}", total=len(loader))
 
     for i, (images, targets) in enumerate(loader):
         images  = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
-        # Mixed precision forward
         with torch.autocast(device_type=device.type, enabled=(device.type == "cuda")):
             output = model(images)
-            loss   = criterion(output, targets)
+            loss = criterion(output, targets)
 
         optimizer.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()       # DDP all-reduces gradients here
+        scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
 
         acc1, acc5 = accuracy(output, targets, topk=(1, 5))
         bs = images.size(0)
+
         losses.update(loss.item(), bs)
         top1.update(acc1, bs)
         top5.update(acc5, bs)
+
         batch_time.update(time.perf_counter() - end)
         end = time.perf_counter()
 
-        if rank == 0 and (i + 1) % args.log_interval == 0:
-            print(
-                f"  [Train] Epoch {epoch:>3d} | "
-                f"Batch {i+1:>4d}/{len(loader)} | "
-                f"Loss {losses.avg:.4f} | "
-                f"Acc@1 {top1.avg:.2f}% | "
-                f"Acc@5 {top5.avg:.2f}% | "
-                f"Batch {batch_time.avg*1000:.1f}ms"
-            )
+        if rank == 0:
+            loader.set_postfix({
+                "loss": f"{losses.avg:.4f}",
+                "acc1": f"{top1.avg:.2f}",
+                "acc5": f"{top5.avg:.2f}",
+            })
+
+            if (i + 1) % args.log_interval == 0:
+                print(
+                    f"  [Train] Epoch {epoch} | Batch {i+1}/{len(loader)} | "
+                    f"Loss {losses.avg:.4f} | Acc@1 {top1.avg:.2f}% | "
+                    f"Acc@5 {top5.avg:.2f}%"
+                )
 
     return losses.avg, top1.avg, top5.avg
 
